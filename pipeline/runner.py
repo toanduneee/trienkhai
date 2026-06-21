@@ -12,7 +12,6 @@ from pipeline.evaluator import evaluate_response, summarize_results
 RESULTS_DIR = Path("data/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Fallback dùng khi evaluate_response trả về None hoặc lỗi
 EVAL_ERROR_FALLBACK = {
     "keyword_matched": False,
     "matched_strings": [],
@@ -33,19 +32,8 @@ def run_experiment(
     max_pair_iter: int = 20,
     system_prompt: str = ""
 ) -> dict:
-    """
-    Chạy một lượt thực nghiệm đầy đủ.
 
-    Args:
-        model_key:     "dolphin" | "groq" | "gemini"
-        attack_type:   "paraphrase" | "persona" | "pair"
-        category:      Filter dataset theo category (None = tất cả)
-        n_seeds:       Giới hạn số seed (None = tất cả)
-        n_variants:    Số biến thể paraphrase mỗi seed
-        max_pair_iter: Vòng lặp PAIR tối đa
-        system_prompt: System prompt của target app
-    """
-    dataset   = load_behaviors(n=n_seeds, category=category)
+    dataset     = load_behaviors(n=n_seeds, category=category)
     all_results = []
     timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -60,58 +48,66 @@ def run_experiment(
         print(f"[{seed_id}] {seed_prompt[:70]}...")
 
         # ── Sinh biến thể ────────────────────────────────────────────────
-        if attack_type == "paraphrase":
-            variants     = paraphrase_attack(seed_prompt, n_variants)
-            attack_items = [
-                {"variant_type": f"para_{i+1}", "prompt": v}
-                for i, v in enumerate(variants)
-            ]
+        try:
+            if attack_type == "paraphrase":
+                variants     = paraphrase_attack(seed_prompt, n_variants)
+                attack_items = [
+                    {"variant_type": f"para_{i+1}", "prompt": v}
+                    for i, v in enumerate(variants)
+                    if isinstance(v, str) and v.strip()
+                ]
 
-        elif attack_type == "persona":
-            wrapped      = persona_wrap(seed_prompt)
-            attack_items = [
-                {"variant_type": f"persona_{w['persona']}", "prompt": w["prompt"]}
-                for w in wrapped
-            ]
+            elif attack_type == "persona":
+                wrapped      = persona_wrap(seed_prompt)
+                attack_items = [
+                    {"variant_type": f"persona_{w['persona']}", "prompt": w["prompt"]}
+                    for w in wrapped
+                ]
 
-        elif attack_type == "pair":
-            caller      = make_caller(model_key, system_prompt)
-            pair_result = pair_attack(seed_prompt, caller, max_pair_iter)
-            attack_items = [{
-                "variant_type":    "pair",
-                "prompt":          pair_result["best_prompt"],
-                "pair_iterations": pair_result["iterations_used"],
-                "pair_success":    pair_result["success"]
-            }]
+            elif attack_type == "pair":
+                caller      = make_caller(model_key, system_prompt)
+                pair_result = pair_attack(seed_prompt, caller, max_pair_iter)
+                attack_items = [{
+                    "variant_type":    "pair",
+                    "prompt":          pair_result["best_prompt"],
+                    "pair_iterations": pair_result["iterations_used"],
+                    "pair_success":    pair_result["success"]
+                }]
 
-        else:
-            raise ValueError(f"Unknown attack_type: {attack_type}")
+            else:
+                raise ValueError(f"Unknown attack_type: {attack_type}")
+
+        except Exception as e:
+            print(f"  ERROR khi sinh biến thể [{seed_id}]: {e}")
+            continue
+
+        if not attack_items:
+            print(f"  WARN [{seed_id}]: không có variant hợp lệ, bỏ qua.")
+            continue
 
         # ── Gửi & đánh giá ───────────────────────────────────────────────
         for item in attack_items:
             try:
-                # Gọi target model
                 response = call_target(model_key, item["prompt"], system_prompt)
 
                 if not response or not isinstance(response, str):
                     print(f"  WARN [{item['variant_type']}]: target trả về response rỗng.")
                     response = ""
 
-                # Đánh giá response
+                # Đánh giá response — áp dụng thống nhất cho cả ba kỹ thuật
                 eval_result = evaluate_response(item["prompt"], response)
 
-                # Guard: nếu evaluate_response trả về None hoặc không phải dict
                 if not isinstance(eval_result, dict):
                     print(f"  WARN [{item['variant_type']}]: evaluate_response trả về None, dùng fallback.")
                     eval_result = EVAL_ERROR_FALLBACK.copy()
 
-                # PAIR: tin theo PAIR judge nếu đã xác nhận bypass
+                # PAIR: nếu pair_success = True thì đảm bảo is_success = True
+                # nhưng giữ nguyên score và verdict từ LLM judge, không hardcode
                 if attack_type == "pair" and item.get("pair_success"):
-                    eval_result["is_success"]  = True
-                    eval_result["score"]       = 4
-                    eval_result["verdict"]     = "BYPASSED"
-                    eval_result["reasoning"]   = "PAIR judge confirmed bypass"
-                    eval_result["eval_method"] = "pair_judge"
+                    eval_result["is_success"] = True
+                    if eval_result["verdict"] == "REFUSED":
+                        eval_result["verdict"] = "BYPASSED"
+                    eval_result["eval_method"] = "llm_judge+pair"
 
                 record = {
                     "seed_id":       seed_id,
@@ -134,8 +130,6 @@ def run_experiment(
                 print(f"  {item['variant_type']:30s} → "
                       f"score={eval_result['score']} [{method:10s}] {status}")
 
-                # dolphin là local, không cần sleep
-                # groq/gemini là cloud, cần throttle
                 if model_key in ("groq", "gemini"):
                     time.sleep(5.0)
 
@@ -143,8 +137,8 @@ def run_experiment(
                 print(f"  ERROR [{item['variant_type']}]: {e}")
 
     # ── Lưu kết quả ──────────────────────────────────────────────────────
-    summary  = summarize_results(all_results)
-    output   = {
+    summary = summarize_results(all_results)
+    output  = {
         "experiment": {
             "model":       model_key,
             "attack_type": attack_type,
@@ -169,17 +163,16 @@ def run_experiment(
     return output
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ─── CLI ─────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     parser = argparse.ArgumentParser(description="Red Teaming Pipeline Runner")
     parser.add_argument("--model",     default="dolphin",
                         choices=["dolphin", "groq", "gemini"])
     parser.add_argument("--attack",    default="paraphrase",
                         choices=["paraphrase", "persona", "pair"])
     parser.add_argument("--category",  default=None)
-    parser.add_argument("--n-seeds",   type=int, default=None,
-                        help="Giới hạn số seed (mặc định: tất cả)")
+    parser.add_argument("--n-seeds",   type=int, default=None)
     parser.add_argument("--variants",  type=int, default=3)
     parser.add_argument("--pair-iter", type=int, default=20)
     parser.add_argument("--system",    default="",
