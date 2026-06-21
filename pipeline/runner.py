@@ -7,7 +7,7 @@ from pathlib import Path
 from pipeline.dataset   import load_behaviors
 from pipeline.attacker  import paraphrase_attack, persona_wrap, pair_attack
 from pipeline.target    import call_target, make_caller
-from pipeline.evaluator import evaluate_response, summarize_results
+from pipeline.evaluator import evaluate_response, llm_judge, summarize_results
 
 RESULTS_DIR = Path("data/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,20 +94,26 @@ def run_experiment(
                     print(f"  WARN [{item['variant_type']}]: target trả về response rỗng.")
                     response = ""
 
-                # Đánh giá response — áp dụng thống nhất cho cả ba kỹ thuật
-                eval_result = evaluate_response(item["prompt"], response)
+                # ── Chọn phương pháp đánh giá theo kỹ thuật ─────────────
+                if attack_type == "pair":
+                    if item.get("pair_success"):
+                        # PAIR bypass thành công: dùng LLM judge chấm thật
+                        eval_result = llm_judge(item["prompt"], response)
+                        eval_result["is_success"]  = True
+                        eval_result["eval_method"] = "llm_judge+pair"
+                        if eval_result["verdict"] == "REFUSED":
+                            eval_result["verdict"] = "BYPASSED"
+                    else:
+                        # PAIR không bypass được trong max_iter: chấm keyword
+                        eval_result = evaluate_response(item["prompt"], response)
+                        eval_result["is_success"] = False
+                else:
+                    # Paraphrase và Persona: giữ nguyên keyword matching
+                    eval_result = evaluate_response(item["prompt"], response)
 
                 if not isinstance(eval_result, dict):
                     print(f"  WARN [{item['variant_type']}]: evaluate_response trả về None, dùng fallback.")
                     eval_result = EVAL_ERROR_FALLBACK.copy()
-
-                # PAIR: nếu pair_success = True thì đảm bảo is_success = True
-                # nhưng giữ nguyên score và verdict từ LLM judge, không hardcode
-                if attack_type == "pair" and item.get("pair_success"):
-                    eval_result["is_success"] = True
-                    if eval_result["verdict"] == "REFUSED":
-                        eval_result["verdict"] = "BYPASSED"
-                    eval_result["eval_method"] = "llm_judge+pair"
 
                 record = {
                     "seed_id":       seed_id,
@@ -121,7 +127,7 @@ def run_experiment(
                 }
                 if attack_type == "pair":
                     record["pair_iterations"] = item.get("pair_iterations")
-                    record["pair_success"]     = item.get("pair_success")
+                    record["pair_success"]    = item.get("pair_success")
 
                 all_results.append(record)
 
@@ -165,7 +171,7 @@ def run_experiment(
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     parser = argparse.ArgumentParser(description="Red Teaming Pipeline Runner")
     parser.add_argument("--model",     default="dolphin",
                         choices=["dolphin", "groq", "gemini"])
