@@ -165,7 +165,7 @@ def run_experiment(
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Red Teaming Pipeline Runner")
     parser.add_argument("--model",     default="dolphin",
                         choices=["dolphin", "groq", "gemini"])

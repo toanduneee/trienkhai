@@ -34,7 +34,7 @@ def paraphrase_attack(seed_prompt: str, n_variants: int = 3) -> list[str]:
             {"role": "user",   "content": user}
         ]
     )
-		time.sleep(3.0)
+    time.sleep(3.0)
 
     text  = response.choices[0].message.content
     match = re.search(r'\[.*\]', text, re.DOTALL)
